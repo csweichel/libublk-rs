@@ -1,14 +1,17 @@
 [package]
 name = "libublk"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "Library for building linux block device in userspace"
 authors = ["Ming Lei <tom.leiming@gmail.com>"]
-readme = "README.rst"
+readme = "README.md"
 repository = "https://github.com/ming1/libublk-rs"
 license = "MIT OR Apache-2.0"
 keywords = ["ublk", "io_uring", "userspace", "block", "storage"]
-publish = false
+publish = true
+
+[badges]
+maintenance = { status = "actively-developed" }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -26,6 +29,7 @@ serde_json = "1.0.79"
 bitmaps = "3.2.0"
 log = {version = "0.4", features = ["release_max_level_off"]}
 thiserror = "1.0.43"
+derive_builder = "0.12"
 
 [dev-dependencies]
 block-utils = "0.11.0"

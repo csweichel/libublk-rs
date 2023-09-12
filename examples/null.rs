@@ -1,89 +1,86 @@
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, UblkQueueCtx};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
-use std::sync::Arc;
 
-fn null_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx, park: bool) -> Result<i32, UblkError> {
-    let iod = ctx.get_iod(io.get_tag());
-    let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
-
-    if !park {
-        io.complete_io(bytes);
-        Ok(0)
+fn null_add(dev_id: i32, comp_batch: bool) {
+    let dflags = if comp_batch {
+        libublk::UBLK_DEV_F_COMP_BATCH
     } else {
-        io.add_to_comp_batch(io.get_tag() as u16, bytes);
-        Ok(libublk::io::UBLK_IO_S_COMP_BATCH)
-    }
-}
-fn test_add(dev_id: i32) {
-    let s = std::env::args().nth(3).unwrap_or_else(|| "0".to_string());
-    let park = s.parse::<i32>().unwrap();
-    let nr_queues = 2; //two queues
-                       //io depth: 64, max buf size: 512KB
-    let mut ctrl = UblkCtrl::new(dev_id, nr_queues, 64, 512 << 10, 0, true).unwrap();
+        0
+    };
+    println!("IO complete batch {}", comp_batch);
+    let sess = libublk::UblkSessionBuilder::default()
+        .name("null")
+        .depth(64_u32)
+        .nr_queues(2_u32)
+        .id(dev_id)
+        .dev_flags(dflags | libublk::UBLK_DEV_F_ADD_DEV)
+        .build()
+        .unwrap();
 
-    //target specific initialization is done in this closure
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(250_u64 << 30);
         Ok(serde_json::json!({}))
     };
-    let ublk_dev = std::sync::Arc::new(
-        UblkDev::new(
-            "null".to_string(),
-            tgt_init,
+
+    let wh = {
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let handle_io_batch =
+            move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
+                let iod = ctx.get_iod(io.get_tag());
+                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+
+                io.add_to_comp_batch(io.get_tag() as u16, bytes);
+                Ok(libublk::io::UBLK_IO_S_COMP_BATCH)
+            };
+        let handle_io = move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
+            let iod = ctx.get_iod(io.get_tag());
+            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+
+            io.complete_io(bytes);
+            Ok(0)
+        };
+
+        sess.run(
             &mut ctrl,
-            if park != 0 {
-                libublk::io::UBLK_DEV_F_COMP_BATCH
+            &dev,
+            if comp_batch {
+                handle_io_batch
             } else {
-                0
+                handle_io
+            },
+            |dev_id| {
+                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                d_ctrl.dump();
             },
         )
-        .unwrap(),
-    );
-    let mut threads = Vec::new();
-
-    println!("park completed IO {}", park);
-
-    for q in 0..nr_queues {
-        let dev = Arc::clone(&ublk_dev);
-        threads.push(std::thread::spawn(move || {
-            let mut queue = UblkQueue::new(q as u16, &dev).unwrap();
-            let ctx = queue.make_queue_ctx();
-
-            //IO handling closure(FnMut), we are driven by io_uring CQE, and
-            //this closure is called for every incoming CQE(io command or
-            //target io completion)
-            let io_handler = move |io: &mut UblkIOCtx| null_handle_io(&ctx, io, park != 0);
-            queue.wait_and_handle_io(io_handler);
-        }));
-    }
-    ctrl.start_dev(&ublk_dev).unwrap();
-    ctrl.dump();
-    for qh in threads {
-        qh.join().unwrap();
-    }
-    ctrl.stop_dev(&ublk_dev).unwrap();
+        .unwrap()
+    };
+    wh.join().unwrap();
 }
 
-fn test_del() {
+fn null_del() {
     let s = std::env::args().nth(2).unwrap_or_else(|| "0".to_string());
     let dev_id = s.parse::<i32>().unwrap();
-    let mut ctrl = UblkCtrl::new(dev_id as i32, 0, 0, 0, 0, false).unwrap();
+    let mut ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
 
-    ctrl.del().unwrap();
+    ctrl.del_dev().unwrap();
 }
 
 fn main() {
     if let Some(cmd) = std::env::args().nth(1) {
         match cmd.as_str() {
             "add" => {
-                let s = std::env::args().nth(2).unwrap_or_else(|| "-1".to_string());
-                let dev_id = s.parse::<i32>().unwrap();
+                let s2 = std::env::args().nth(2).unwrap_or_else(|| "-1".to_string());
+                let dev_id = s2.parse::<i32>().unwrap();
+                let s3 = std::env::args().nth(3).unwrap_or_else(|| "0".to_string());
+                let batch = s3.parse::<i32>().unwrap();
+
                 let _pid = unsafe { libc::fork() };
                 if _pid == 0 {
-                    test_add(dev_id);
+                    null_add(dev_id, batch != 0);
                 }
             }
-            "del" => test_del(),
+            "del" => null_del(),
             _ => todo!(),
         }
     }

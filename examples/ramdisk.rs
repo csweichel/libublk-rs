@@ -44,7 +44,11 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         depth,
         512 << 10,
         libublk::sys::UBLK_F_USER_RECOVERY as u64,
-        for_add,
+        if for_add {
+            libublk::UBLK_DEV_F_ADD_DEV
+        } else {
+            libublk::UBLK_DEV_F_RECOVER_DEV
+        },
     )
     .unwrap();
     let ublk_dev = UblkDev::new(
@@ -54,7 +58,6 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
             Ok(serde_json::json!({}))
         },
         &mut ctrl,
-        0,
     )
     .unwrap();
 
@@ -66,7 +69,8 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
 
         handle_io(i, iod, buf_addr)
     };
-    ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() });
+    ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() })
+        .unwrap();
 
     ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &qc).unwrap();
     ctrl.dump();
@@ -75,12 +79,8 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
 }
 
 fn rd_get_device_size(ctrl: &mut UblkCtrl) -> u64 {
-    ctrl.reload_json().unwrap();
-
-    let tgt_val = &ctrl.json["target"];
-    let tgt: Result<libublk::io::UblkTgt, _> = serde_json::from_value(tgt_val.clone());
-    if let Ok(p) = tgt {
-        p.dev_size
+    if let Ok(tgt) = ctrl.get_target_from_json() {
+        tgt.dev_size
     } else {
         0
     }
@@ -101,7 +101,7 @@ fn test_add(recover: usize) {
 
         if recover > 0 {
             assert!(dev_id >= 0);
-            let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             size = rd_get_device_size(&mut ctrl);
 
             ctrl.start_user_recover().unwrap();
@@ -117,7 +117,7 @@ fn test_add(recover: usize) {
 fn test_del() {
     let s = std::env::args().nth(2).unwrap_or_else(|| "0".to_string());
     let dev_id = s.parse::<i32>().unwrap();
-    let mut ctrl = UblkCtrl::new(dev_id as i32, 0, 0, 0, 0, false).unwrap();
+    let mut ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
 
     ctrl.del().unwrap();
 }

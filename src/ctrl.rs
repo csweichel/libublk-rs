@@ -40,6 +40,7 @@ impl UblkQueueAffinity {
     }
 }
 
+#[repr(C)]
 union CtrlCmd {
     ctrl_cmd: sys::ublksrv_ctrl_cmd,
     buf: [u8; 80],
@@ -135,18 +136,21 @@ struct QueueAffinityJson {
 
 /// ublk control device
 ///
-/// Responsible for:
+/// Responsible for controlling ublk device:
 ///
 /// 1) adding and removing ublk char device(/dev/ublkcN)
 ///
-/// 2) send all kinds of control commands
+/// 2) send all kinds of control commands(recover, list, set/get parameter,
+/// get queue affinity, ...)
 ///
 /// 3) exporting device as json file
 pub struct UblkCtrl {
     file: fs::File,
     pub dev_info: sys::ublksrv_ctrl_dev_info,
     pub json: serde_json::Value,
-    for_add: bool,
+
+    /// global flags, shared with UblkDev and UblkQueue
+    dev_flags: u32,
     cmd_token: i32,
     queue_tids: Vec<i32>,
     nr_queues_configured: u16,
@@ -157,7 +161,7 @@ impl Drop for UblkCtrl {
     fn drop(&mut self) {
         let id = self.dev_info.dev_id;
         trace!("ctrl: device {} dropped", id);
-        if self.for_add {
+        if self.for_add_dev() {
             if let Err(r) = self.del() {
                 //Maybe deleted from other utilities, so no warn or error:w
                 trace!("Delete char device {} failed {}", self.dev_info.dev_id, r);
@@ -177,6 +181,8 @@ impl UblkCtrl {
     /// * `io_buf_bytes`: max buf size for each IO
     /// * `flags`: flags for setting ublk device
     /// * `for_add`: is for adding new device
+    /// * `dev_flags`: global flags as userspace side feature, will be
+    ///     shared with UblkDev and UblkQueue
     ///
     /// ublk control device is for sending command to driver, and maintain
     /// device exported json file, dump, or any misc management task.
@@ -188,8 +194,17 @@ impl UblkCtrl {
         depth: u32,
         io_buf_bytes: u32,
         flags: u64,
-        for_add: bool,
+        dev_flags: u32,
     ) -> Result<UblkCtrl, UblkError> {
+        if !std::path::Path::new(CTRL_PATH).exists() {
+            eprintln!("Please run `modprobe ublk_drv` first");
+            return Err(UblkError::OtherError(-libc::ENOENT));
+        }
+
+        if (dev_flags & !super::UBLK_DEV_F_ALL) != 0 {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+
         if id < 0 && id != -1 {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
@@ -202,7 +217,8 @@ impl UblkCtrl {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
-        if io_buf_bytes > MAX_BUF_SZ {
+        let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+        if io_buf_bytes > MAX_BUF_SZ || io_buf_bytes & (page_sz - 1) != 0 {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
@@ -229,7 +245,6 @@ impl UblkCtrl {
             dev_info: info,
             json: serde_json::json!({}),
             ring,
-            for_add,
             cmd_token: 0,
             queue_tids: {
                 let mut tids = Vec::<i32>::with_capacity(nr_queues as usize);
@@ -239,15 +254,41 @@ impl UblkCtrl {
                 tids
             },
             nr_queues_configured: 0,
+            dev_flags,
         };
 
         //add cdev if the device is for adding device
-        if dev.for_add {
+        if dev.for_add_dev() {
             dev.add()?;
+        } else if id >= 0 {
+            let res = dev.reload_json();
+            if res.is_err() {
+                eprintln!("device reload json failed");
+            }
+            dev.get_info()?;
         }
         trace!("ctrl: device {} created", dev.dev_info.dev_id);
 
         Ok(dev)
+    }
+
+    /// Allocate one simple UblkCtrl device for delelting, listing, recovering,..,
+    /// and it can't be done for adding device
+    pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
+        assert!((dev_flags & super::UBLK_DEV_F_ADD_DEV) == 0);
+        Self::new(id, 0, 0, 0, 0, dev_flags)
+    }
+
+    fn for_add_dev(&self) -> bool {
+        (self.dev_flags & super::UBLK_DEV_F_ADD_DEV) != 0
+    }
+
+    fn for_recover_dev(&self) -> bool {
+        (self.dev_flags & super::UBLK_DEV_F_RECOVER_DEV) != 0
+    }
+
+    pub fn get_dev_flags(&self) -> u32 {
+        self.dev_flags
     }
 
     fn dev_state_desc(&self) -> String {
@@ -271,9 +312,44 @@ impl UblkCtrl {
         let this_queue: Result<QueueAffinityJson, _> = serde_json::from_value(queue.clone());
 
         if let Ok(p) = this_queue {
-            Ok(p.tid.try_into().unwrap())
+            Ok(p.tid as i32)
         } else {
             Err(UblkError::OtherError(-libc::EEXIST))
+        }
+    }
+
+    /// Get target flags from exported json file for this device
+    ///
+    pub fn get_target_flags_from_json(&self) -> Result<u32, UblkError> {
+        let __tgt_flags = &self.json["target_flags"];
+        let tgt_flags: Result<u32, _> = serde_json::from_value(__tgt_flags.clone());
+
+        if let Ok(flags) = tgt_flags {
+            Ok(flags)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// Get target from exported json file for this device
+    ///
+    pub fn get_target_from_json(&self) -> Result<super::io::UblkTgt, UblkError> {
+        let tgt_val = &self.json["target"];
+        let tgt: Result<super::io::UblkTgt, _> = serde_json::from_value(tgt_val.clone());
+        if let Ok(p) = tgt {
+            Ok(p)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// Get target type from exported json file for this device
+    ///
+    pub fn get_target_type_from_json(&self) -> Result<String, UblkError> {
+        if let Ok(tgt) = self.get_target_from_json() {
+            Ok(tgt.tgt_type)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
         }
     }
 
@@ -290,14 +366,16 @@ impl UblkCtrl {
     /// * `pthread_id`: pthread handle for setting affinity
     ///
     /// Note: this method has to be called in queue daemon context
-    pub fn configure_queue(&mut self, dev: &UblkDev, qid: u16, tid: i32) {
+    pub fn configure_queue(&mut self, dev: &UblkDev, qid: u16, tid: i32) -> Result<i32, UblkError> {
         self.store_queue_tid(qid, tid);
 
         self.nr_queues_configured += 1;
 
         if self.nr_queues_configured == self.dev_info.nr_hw_queues {
-            self.build_json(dev);
+            self.build_json(dev)?;
         }
+
+        Ok(0)
     }
 
     pub fn queues_configured(&self) -> bool {
@@ -452,6 +530,24 @@ impl UblkCtrl {
         Ok(0)
     }
 
+    /// Retrieving supported UBLK FEATURES from ublk driver
+    ///
+    /// Supported since linux kernel v6.5
+    pub fn get_features(&mut self) -> Result<u64, UblkError> {
+        let features = 0_u64;
+        let data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: sys::UBLK_U_CMD_GET_FEATURES,
+            flags: CTRL_CMD_HAS_BUF,
+            addr: std::ptr::addr_of!(features) as u64,
+            len: core::mem::size_of::<u64>() as u32,
+            ..Default::default()
+        };
+
+        ublk_ctrl_cmd(self, &data)?;
+
+        Ok(features)
+    }
+
     /// Retrieving device info from ublk driver
     ///
     pub fn get_info(&mut self) -> Result<i32, UblkError> {
@@ -547,7 +643,7 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    pub fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
+    fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_START_USER_RECOVERY,
             ..Default::default()
@@ -600,8 +696,11 @@ impl UblkCtrl {
             self.set_params(&dev.tgt.params)?;
             self.flush_json()?;
             self.start(unsafe { libc::getpid() as i32 }, async_cmd)?
-        } else {
+        } else if self.for_recover_dev() {
+            self.flush_json()?;
             self.end_user_recover(unsafe { libc::getpid() as i32 }, async_cmd)?
+        } else {
+            panic!();
         };
 
         Ok(token)
@@ -678,7 +777,7 @@ impl UblkCtrl {
     /// Remove json export, and send stop command to control device
     ///
     pub fn stop_dev(&mut self, _dev: &UblkDev) -> Result<i32, UblkError> {
-        if self.for_add && std::path::Path::new(&self.run_path()).exists() {
+        if self.for_add_dev() && std::path::Path::new(&self.run_path()).exists() {
             fs::remove_file(self.run_path()).map_err(UblkError::OtherIOError)?;
         }
         self.stop()
@@ -687,6 +786,12 @@ impl UblkCtrl {
     /// Flush this device's json info as file
     pub fn flush_json(&mut self) -> Result<i32, UblkError> {
         if self.json == serde_json::json!({}) {
+            return Ok(0);
+        }
+
+        // flushing json should only be done in case of adding new device
+        // or recovering old device
+        if !self.for_add_dev() && !self.for_recover_dev() {
             return Ok(0);
         }
 
@@ -712,13 +817,13 @@ impl UblkCtrl {
     /// * `tids`: queue pthread tid vector, in which each item stores the queue's
     /// pthread tid
     ///
-    fn build_json(&mut self, dev: &UblkDev) {
+    fn build_json(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
         let tgt_data = self.json.clone();
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
         for qid in 0..dev.dev_info.nr_hw_queues {
             let mut affinity = self::UblkQueueAffinity::new();
-            self.get_queue_affinity(qid as u32, &mut affinity).unwrap();
+            self.get_queue_affinity(qid as u32, &mut affinity)?;
 
             map.insert(
                 format!("{}", qid),
@@ -733,12 +838,14 @@ impl UblkCtrl {
         let mut json = serde_json::json!({
                     "dev_info": dev.dev_info,
                     "target": dev.tgt,
+                    "target_flags": dev.flags,
         });
 
         json["target_data"] = tgt_data;
         json["queues"] = serde_json::Value::Object(map);
 
         self.json = json;
+        Ok(0)
     }
 
     /// Reload json info for this device
